@@ -110,6 +110,50 @@ def update_raw_field(raw_hex, old_value, new_value):
         return raw_hex
 
 
+def _apply_update(annot, old_value, new_value, now_str, stats):
+    """
+    Apply a replacement to a single annotation object in-place.
+
+    Updates all locations where Bluebeam stores visible text:
+      /Contents  — the PDF-standard text field (used by Comments panel)
+      /RC        — rich-content XML (used by some annotation subtypes)
+      /Raw       — Bluebeam's private compressed blob
+      /AP        — pre-rendered appearance stream; DELETED so that Revu
+                   regenerates it from /Contents on next open. Without
+                   this step the old text remains visible even though
+                   /Contents has been updated.
+    """
+    # 1. Update /Contents
+    annot["/Contents"] = pikepdf.String(new_value)
+
+    # 2. Update /M (modification date)
+    if "/M" in annot.keys():
+        annot["/M"] = pikepdf.String(now_str)
+
+    # 3. Update /RC rich-content XML — replace bare text occurrences
+    rc = annot.get("/RC")
+    if rc is not None:
+        rc_str = str(rc)
+        rc_str = re.sub(re.escape(old_value), new_value, rc_str)
+        annot["/RC"] = pikepdf.String(rc_str)
+
+    # 4. Update /Raw (Bluebeam private compressed blob)
+    raw_key = "/Raw" if "/Raw" in annot.keys() else ("/BB:Raw" if "/BB:Raw" in annot.keys() else None)
+    if raw_key:
+        raw_hex = str(annot.get(raw_key) or "")
+        if raw_hex:
+            new_raw = update_raw_field(raw_hex, old_value, new_value)
+            annot[raw_key] = pikepdf.String(new_raw)
+            stats["raw_updated"] += 1
+
+    # 5. Delete /AP appearance stream — forces Revu to regenerate the
+    #    visible text from /Contents on next open. This is the critical
+    #    step: without it Revu displays the cached pre-rendered appearance
+    #    and ignores the updated /Contents value entirely.
+    if "/AP" in annot.keys():
+        del annot["/AP"]
+
+
 def process_pdf_bytes(pdf_bytes, lookup_dict, delete_list,
                       delete_empty=False, delete_notfound=False):
     """
@@ -155,19 +199,7 @@ def process_pdf_bytes(pdf_bytes, lookup_dict, delete_list,
 
             elif old_value in lookup_dict:
                 new_value = lookup_dict[old_value]
-                annot["/Contents"] = pikepdf.String(new_value)
-                if "/M" in annot:
-                    annot["/M"] = pikepdf.String(now_str)
-
-                raw_obj = annot.get("/Raw") or annot.get("/BB:Raw")
-                if raw_obj is not None:
-                    raw_hex = str(raw_obj)
-                    if raw_hex:
-                        new_raw = update_raw_field(raw_hex, old_value, new_value)
-                        key = "/Raw" if "/Raw" in annot.keys() else "/BB:Raw"
-                        annot[key] = pikepdf.String(new_raw)
-                        stats["raw_updated"] += 1
-
+                _apply_update(annot, old_value, new_value, now_str, stats)
                 stats["modified"] += 1
                 stats["changes"].append({
                     "page": page_label, "old": old_value, "new": new_value,
@@ -185,6 +217,17 @@ def process_pdf_bytes(pdf_bytes, lookup_dict, delete_list,
                 keep.append(annot)
 
         page["/Annots"] = pikepdf.Array(keep)
+
+    # Tell any PDF viewer (including Revu) to regenerate appearance streams
+    # for all annotations whose /AP was removed. Without this flag some
+    # viewers may show blank boxes instead of regenerating from /Contents.
+    if "/AcroForm" in pdf.Root.keys():
+        pdf.Root.AcroForm["/NeedAppearances"] = True
+    else:
+        pdf.Root.AcroForm = pikepdf.Dictionary(
+            Fields=pikepdf.Array(),
+            NeedAppearances=True,
+        )
 
     out_buf = io.BytesIO()
     pdf.save(out_buf)
