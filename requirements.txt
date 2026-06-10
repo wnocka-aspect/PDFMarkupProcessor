@@ -1,4 +1,4 @@
-pikepdf==8.15.1
+pikepdf>=10.7.0
 pandas>=2.0
 openpyxl>=3.1
 streamlit>=1.35
